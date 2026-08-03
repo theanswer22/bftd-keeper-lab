@@ -19,7 +19,7 @@ from urllib3.util.retry import Retry
 
 # ---- config.py ----
 APP_NAME = 'BFTD Keeper Lab'
-APP_VERSION = '2.2.0'
+APP_VERSION = '2.3.0'
 DEFAULT_LEAGUE_ID = '1339101169082990592'
 SKILL_POSITIONS = ('QB', 'RB', 'WR', 'TE', 'K', 'DEF')
 CORE_POSITIONS = ('QB', 'RB', 'WR', 'TE')
@@ -45,6 +45,49 @@ def normalize_name(value: object) -> str:
     tokens = [token for token in text.split() if token not in _SUFFIXES]
     normalized = ' '.join(tokens)
     return _COMMON_ALIASES.get(normalized, normalized)
+
+
+_TEAM_ALIASES = {
+    'JAC': 'JAX', 'GBP': 'GB', 'KCC': 'KC', 'LVR': 'LV', 'NOS': 'NO',
+    'NEP': 'NE', 'SFO': 'SF', 'TBB': 'TB', 'WSH': 'WAS', 'LA': 'LAR',
+}
+
+def normalize_position(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ''
+    text = str(value).upper().strip().replace('D/ST', 'DST')
+    match = re.match(r'^(QB|RB|WR|TE|K|DST|DEF)', text)
+    if not match:
+        return text
+    position = match.group(1)
+    return 'DEF' if position == 'DST' else position
+
+def normalize_team(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ''
+    text = str(value).upper().strip()
+    if text in {'', 'NAN', '<NA>', 'NONE'}:
+        return ''
+    return _TEAM_ALIASES.get(text, text)
+
+def _clean_external_player_name(value: object) -> tuple[str, str]:
+    if value is None or pd.isna(value):
+        return '', ''
+    text = str(value).strip()
+    # FantasyPros commonly places the NFL team at the end of the player field,
+    # e.g. "J. Allen (BUF)". Strip it for matching and preserve it separately.
+    team_match = re.search(r'\(([A-Z]{2,3}|FA)\)\s*$', text, flags=re.I)
+    team = normalize_team(team_match.group(1)) if team_match else ''
+    if team_match:
+        text = text[:team_match.start()].strip()
+    text = re.sub(r'\s+(Q|O|IR|PUP|SUSP|D|NA)\s*$', '', text, flags=re.I).strip()
+    return text, team
+
+def _initial_last_key(value: object) -> str:
+    tokens = normalize_name(value).split()
+    if len(tokens) < 2:
+        return ''
+    return f'{tokens[0][0]} {tokens[-1]}'
 
 # ---- keeper_optimizer.py ----
 @dataclass
@@ -130,6 +173,8 @@ class MatchReport:
     total_rostered: int
     matched: int
     unmatched_names: tuple[str, ...] = ()
+    method_counts: tuple[tuple[str, int], ...] = ()
+    source_rows: int = 0
 COLUMN_ALIASES = {'player_name': ['player_name', 'player', 'name', 'player name', 'full_name', 'full name'], 'external_rank': ['rank', 'rk', 'overall rank', 'overall_rank', 'ecr', 'overall', 'redraft rank', 'superflex rank', 'sf rank'], 'external_value': ['value', 'trade value', 'player value', 'score', 'points', 'fantasycalc value', 'superflex value', 'sf value'], 'position': ['position', 'pos', 'player position'], 'nfl_team': ['team', 'nfl team', 'nfl_team', 'tm'], 'external_age': ['age', 'player age'], 'external_years_exp': ['years_exp', 'years exp', 'experience', 'exp'], 'sleeper_id': ['sleeper_id', 'sleeper id', 'sleeperid'], 'source_adp': ['adp', 'average draft position'], 'tier': ['tier']}
 
 def _uploaded_bytes(file_obj: BinaryIO | TextIO) -> tuple[bytes, str]:
@@ -227,11 +272,16 @@ def load_rankings_csv(file_obj: BinaryIO | TextIO) -> pd.DataFrame:
     for col in ['position', 'nfl_team', 'sleeper_id']:
         if col not in data.columns:
             data[col] = pd.NA
-    data['player_name'] = data['player_name'].astype(str).str.strip()
-    data = data[data['player_name'].ne('') & data['player_name'].ne('nan')].copy()
+    data['player_name_raw'] = data['player_name'].astype(str).str.strip()
+    parsed_names = data['player_name_raw'].map(_clean_external_player_name)
+    data['player_name'] = parsed_names.map(lambda item: item[0])
+    parsed_teams = parsed_names.map(lambda item: item[1])
+    data = data[data['player_name'].ne('') & data['player_name'].str.lower().ne('nan')].copy()
     data['normalized_name'] = data['player_name'].map(normalize_name)
-    data['position'] = data['position'].astype('string').str.upper().str.strip()
-    data['nfl_team'] = data['nfl_team'].astype('string').str.upper().str.strip()
+    data['initial_last_key'] = data['player_name'].map(_initial_last_key)
+    data['position'] = data['position'].map(normalize_position).astype('string')
+    existing_team = data['nfl_team'].map(normalize_team)
+    data['nfl_team'] = existing_team.where(existing_team.ne(''), parsed_teams).astype('string')
     data['sleeper_id'] = data['sleeper_id'].astype('string').str.replace('\\.0$', '', regex=True)
     if data['external_value'].notna().any():
         data['optimizer_score'] = data['external_value']
@@ -242,40 +292,82 @@ def load_rankings_csv(file_obj: BinaryIO | TextIO) -> pd.DataFrame:
             raise ValueError('The detected rank column contains no usable numeric values.')
         data['optimizer_score'] = float(max_rank) + 1.0 - data['external_rank']
         data['score_basis'] = 'inverse external rank'
-    data = data.sort_values(['optimizer_score', 'external_rank'], ascending=[False, True], na_position='last').drop_duplicates(['normalized_name', 'position'], keep='first')
+    data = data.sort_values(['optimizer_score', 'external_rank'], ascending=[False, True], na_position='last').drop_duplicates(['normalized_name', 'position', 'nfl_team'], keep='first')
     return data.reset_index(drop=True)
 
 def merge_rosters_with_rankings(rosters: pd.DataFrame, rankings: pd.DataFrame) -> tuple[pd.DataFrame, MatchReport]:
     left = rosters.copy().reset_index(drop=True)
-    right = rankings.copy()
+    right = rankings.copy().reset_index(drop=True)
     left['normalized_name'] = left['player_name'].map(normalize_name)
-    left['position'] = left['position'].astype('string').str.upper().str.strip()
+    left['initial_last_key'] = left['player_name'].map(_initial_last_key)
+    left['position'] = left['position'].map(normalize_position).astype('string')
+    left['nfl_team'] = left.get('nfl_team', pd.Series('', index=left.index)).map(normalize_team).astype('string')
+    right['position'] = right['position'].map(normalize_position).astype('string')
+    right['nfl_team'] = right.get('nfl_team', pd.Series('', index=right.index)).map(normalize_team).astype('string')
+    if 'initial_last_key' not in right.columns:
+        right['initial_last_key'] = right['player_name'].map(_initial_last_key)
+
     fields = ['external_rank', 'external_value', 'external_age', 'external_years_exp', 'source_adp', 'tier', 'optimizer_score', 'score_basis']
     for col in fields:
         if col not in left.columns:
             left[col] = pd.NA
-    if right['sleeper_id'].notna().any():
-        by_id = right.dropna(subset=['sleeper_id']).drop_duplicates('sleeper_id')
-        lookup = by_id.set_index('sleeper_id')[fields]
-        player_ids = left['player_id'].astype('string')
+    left['_match_method'] = ''
+
+    def apply_lookup(key_cols: list[str], method: str, *, unique_only: bool=True) -> None:
+        candidates = right[right['optimizer_score'].notna()].copy()
+        candidates = candidates.dropna(subset=key_cols)
+        for key in key_cols:
+            candidates = candidates[candidates[key].astype(str).ne('')]
+        if candidates.empty:
+            return
+        if unique_only:
+            counts = candidates.groupby(key_cols, dropna=False).size().rename('_count')
+            candidates = candidates.join(counts, on=key_cols)
+            candidates = candidates[candidates['_count'].eq(1)]
+        candidates = candidates.sort_values('optimizer_score', ascending=False).drop_duplicates(key_cols)
+        if candidates.empty:
+            return
+        lookup = candidates.set_index(key_cols)
+        if len(key_cols) == 1:
+            incoming_score = left[key_cols[0]].map(lookup['optimizer_score'])
+        else:
+            keys = pd.MultiIndex.from_frame(left[key_cols])
+            incoming_score = pd.Series(keys.map(lookup['optimizer_score']), index=left.index)
+        newly_matched = left['optimizer_score'].isna() & incoming_score.notna()
+        if not newly_matched.any():
+            return
         for col in fields:
-            incoming = player_ids.map(lookup[col])
-            mask = left[col].isna() & incoming.notna()
+            if len(key_cols) == 1:
+                incoming = left[key_cols[0]].map(lookup[col])
+            else:
+                keys = pd.MultiIndex.from_frame(left[key_cols])
+                incoming = pd.Series(keys.map(lookup[col]), index=left.index)
+            mask = newly_matched & incoming.notna()
             left.loc[mask, col] = incoming.loc[mask]
-    by_name_pos = right.drop_duplicates(['normalized_name', 'position']).set_index(['normalized_name', 'position'])
-    keys = pd.MultiIndex.from_frame(left[['normalized_name', 'position']])
-    for col in fields:
-        values = pd.Series(keys.map(by_name_pos[col]), index=left.index)
-        mask = left[col].isna() & values.notna()
-        left.loc[mask, col] = values.loc[mask]
-    by_name = right.sort_values('optimizer_score', ascending=False).drop_duplicates('normalized_name').set_index('normalized_name')
-    for col in fields:
-        incoming = left['normalized_name'].map(by_name[col])
-        mask = left[col].isna() & incoming.notna()
-        left.loc[mask, col] = incoming.loc[mask]
+        left.loc[newly_matched, '_match_method'] = method
+
+    # Strongest to loosest. Each fallback requires a unique source candidate.
+    if right['sleeper_id'].notna().any():
+        by_id = right.dropna(subset=['sleeper_id']).drop_duplicates('sleeper_id').set_index('sleeper_id')
+        player_ids = left['player_id'].astype('string')
+        incoming_score = player_ids.map(by_id['optimizer_score'])
+        newly_matched = left['optimizer_score'].isna() & incoming_score.notna()
+        for col in fields:
+            incoming = player_ids.map(by_id[col])
+            mask = newly_matched & incoming.notna()
+            left.loc[mask, col] = incoming.loc[mask]
+        left.loc[newly_matched, '_match_method'] = 'Sleeper ID'
+
+    apply_lookup(['normalized_name', 'position'], 'Exact name + position')
+    apply_lookup(['normalized_name'], 'Exact name')
+    apply_lookup(['initial_last_key', 'position', 'nfl_team'], 'Initial/last + position + team')
+    apply_lookup(['initial_last_key', 'position'], 'Initial/last + position')
+
     matched_mask = pd.to_numeric(left['optimizer_score'], errors='coerce').notna()
     unmatched = tuple(left.loc[~matched_mask, 'player_name'].dropna().astype(str).tolist())
-    return (left, MatchReport(len(left), int(matched_mask.sum()), unmatched))
+    counts = tuple((str(k), int(v)) for k, v in left.loc[matched_mask, '_match_method'].value_counts().items())
+    left = left.drop(columns=['_match_method'])
+    return left, MatchReport(len(left), int(matched_mask.sum()), unmatched, counts, len(right))
 
 # ---- external_metrics.py ----
 @dataclass(frozen=True)
@@ -705,6 +797,13 @@ if rankings_file is not None:
         merged, match_report = merge_rosters_with_rankings(roster_table, rankings)
         rankings_enriched = rankings.copy()
         st.success(f'Rankings loaded: {len(rankings):,} players; matched {match_report.matched:,} of {match_report.total_rostered:,} rostered players.')
+        if len(rankings) < 100:
+            st.warning('This rankings file contains fewer than 100 usable player rows. It may be a partial export rather than the full rankings list.')
+        if match_report.total_rostered and match_report.matched / match_report.total_rostered < 0.7:
+            st.warning('The match rate is still low. Open the unmatched list and verify that the uploaded file is the full NFL rankings export, not a filtered or partial table.')
+        if match_report.method_counts:
+            method_text = ' · '.join(f'{method}: {count}' for method, count in match_report.method_counts)
+            st.caption(f'Match methods — {method_text}')
         if match_report.unmatched_names:
             with st.expander(f'Unmatched rostered players ({len(match_report.unmatched_names)})'):
                 st.write(', '.join(match_report.unmatched_names))
