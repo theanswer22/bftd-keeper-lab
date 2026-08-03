@@ -19,7 +19,7 @@ from urllib3.util.retry import Retry
 
 # ---- config.py ----
 APP_NAME = 'BFTD Keeper Lab'
-APP_VERSION = '2.3.0'
+APP_VERSION = '2.4.0'
 DEFAULT_LEAGUE_ID = '1339101169082990592'
 SKILL_POSITIONS = ('QB', 'RB', 'WR', 'TE', 'K', 'DEF')
 CORE_POSITIONS = ('QB', 'RB', 'WR', 'TE')
@@ -33,7 +33,7 @@ KEEPER_RULES = KeeperRules()
 
 # ---- name_matching.py ----
 _SUFFIXES = {'jr', 'sr', 'ii', 'iii', 'iv', 'v'}
-_COMMON_ALIASES = {'gabe davis': 'gabriel davis', 'ken walker': 'kenneth walker', 'mike pittman': 'michael pittman', 'hollywood brown': 'marquise brown', 'tank dell': 'nathaniel dell', 'chig okonkwo': 'chigoziem okonkwo', 'dj moore': 'd j moore', 'dk metcalf': 'd k metcalf', 'tj hockenson': 't j hockenson'}
+_COMMON_ALIASES = {'gabe davis': 'gabriel davis', 'ken walker': 'kenneth walker', 'mike pittman': 'michael pittman', 'hollywood brown': 'marquise brown', 'm brown': 'marquise brown', 'tank dell': 'nathaniel dell', 't dell': 'nathaniel dell', 'r pearsall': 'ricky pearsall', 'chig okonkwo': 'chigoziem okonkwo', 'dj moore': 'd j moore', 'dk metcalf': 'd k metcalf', 'tj hockenson': 't j hockenson'}
 
 def normalize_name(value: object) -> str:
     if value is None:
@@ -796,17 +796,27 @@ if rankings_file is not None:
         rankings = load_rankings_csv(rankings_file)
         merged, match_report = merge_rosters_with_rankings(roster_table, rankings)
         rankings_enriched = rankings.copy()
-        st.success(f'Rankings loaded: {len(rankings):,} players; matched {match_report.matched:,} of {match_report.total_rostered:,} rostered players.')
+        non_defense = merged['position'].ne('DEF')
+        non_defense_total = int(non_defense.sum())
+        non_defense_matched = int(merged.loc[non_defense, 'optimizer_score'].notna().sum())
+        unmatched_non_defense = merged.loc[non_defense & merged['optimizer_score'].isna(), 'player_name'].dropna().astype(str).tolist()
+        unmatched_defenses = merged.loc[merged['position'].eq('DEF') & merged['optimizer_score'].isna(), 'player_name'].dropna().astype(str).tolist()
+        st.success(f'Rankings loaded: {len(rankings):,} players; matched {non_defense_matched:,} of {non_defense_total:,} non-defense rostered players.')
+        if unmatched_defenses:
+            st.caption(f'{len(unmatched_defenses)} team defenses are not in this dynasty/keeper ranking file and are excluded from the player match rate.')
         if len(rankings) < 100:
             st.warning('This rankings file contains fewer than 100 usable player rows. It may be a partial export rather than the full rankings list.')
-        if match_report.total_rostered and match_report.matched / match_report.total_rostered < 0.7:
+        if non_defense_total and non_defense_matched / non_defense_total < 0.7:
             st.warning('The match rate is still low. Open the unmatched list and verify that the uploaded file is the full NFL rankings export, not a filtered or partial table.')
         if match_report.method_counts:
             method_text = ' · '.join(f'{method}: {count}' for method, count in match_report.method_counts)
             st.caption(f'Match methods — {method_text}')
-        if match_report.unmatched_names:
-            with st.expander(f'Unmatched rostered players ({len(match_report.unmatched_names)})'):
-                st.write(', '.join(match_report.unmatched_names))
+        if unmatched_non_defense:
+            with st.expander(f'Unmatched non-defense players ({len(unmatched_non_defense)})'):
+                st.write(', '.join(unmatched_non_defense))
+        if unmatched_defenses:
+            with st.expander(f'Unranked team defenses ({len(unmatched_defenses)})'):
+                st.write(', '.join(unmatched_defenses))
     except (ValueError, pd.errors.ParserError) as exc:
         st.error(f'Could not use the rankings file: {exc}')
 for metric_file in metrics_files or []:
