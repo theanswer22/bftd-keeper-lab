@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from io import BytesIO
+from pathlib import Path
+import zipfile
 from itertools import combinations
 from typing import Any, BinaryIO, Iterable, TextIO
 import re
@@ -17,7 +19,7 @@ from urllib3.util.retry import Retry
 
 # ---- config.py ----
 APP_NAME = 'BFTD Keeper Lab'
-APP_VERSION = '2.1.0'
+APP_VERSION = '2.2.0'
 DEFAULT_LEAGUE_ID = '1339101169082990592'
 SKILL_POSITIONS = ('QB', 'RB', 'WR', 'TE', 'K', 'DEF')
 CORE_POSITIONS = ('QB', 'RB', 'WR', 'TE')
@@ -130,13 +132,63 @@ class MatchReport:
     unmatched_names: tuple[str, ...] = ()
 COLUMN_ALIASES = {'player_name': ['player_name', 'player', 'name', 'player name', 'full_name', 'full name'], 'external_rank': ['rank', 'rk', 'overall rank', 'overall_rank', 'ecr', 'overall', 'redraft rank', 'superflex rank', 'sf rank'], 'external_value': ['value', 'trade value', 'player value', 'score', 'points', 'fantasycalc value', 'superflex value', 'sf value'], 'position': ['position', 'pos', 'player position'], 'nfl_team': ['team', 'nfl team', 'nfl_team', 'tm'], 'external_age': ['age', 'player age'], 'external_years_exp': ['years_exp', 'years exp', 'experience', 'exp'], 'sleeper_id': ['sleeper_id', 'sleeper id', 'sleeperid'], 'source_adp': ['adp', 'average draft position'], 'tier': ['tier']}
 
-def _rankings_read_csv(file_obj: BinaryIO | TextIO) -> pd.DataFrame:
-    try:
-        return pd.read_csv(file_obj)
-    except UnicodeDecodeError:
+def _uploaded_bytes(file_obj: BinaryIO | TextIO) -> tuple[bytes, str]:
+    name = str(getattr(file_obj, 'name', '') or '')
+    if hasattr(file_obj, 'getvalue'):
+        payload = file_obj.getvalue()
+    else:
         if hasattr(file_obj, 'seek'):
             file_obj.seek(0)
-        return pd.read_csv(file_obj, encoding='latin-1')
+        payload = file_obj.read()
+    if isinstance(payload, str):
+        payload = payload.encode('utf-8')
+    return bytes(payload), name
+
+def _read_csv_payload(payload: bytes) -> pd.DataFrame:
+    if payload.lstrip().lower().startswith((b'<!doctype html', b'<html')):
+        raise ValueError('This looks like a saved webpage, not a rankings file. Download the actual CSV or Excel file.')
+    last_error: Exception | None = None
+    for encoding in ('utf-8-sig', 'utf-8', 'latin-1'):
+        try:
+            frame = pd.read_csv(BytesIO(payload), encoding=encoding)
+            if len(frame.columns) == 1:
+                detected = pd.read_csv(BytesIO(payload), encoding=encoding, sep=None, engine='python')
+                if len(detected.columns) > 1:
+                    frame = detected
+            return frame
+        except (UnicodeDecodeError, pd.errors.ParserError) as exc:
+            last_error = exc
+    raise ValueError(f'Could not read the CSV file: {last_error}')
+
+def _read_uploaded_table(file_obj: BinaryIO | TextIO) -> pd.DataFrame:
+    payload, original_name = _uploaded_bytes(file_obj)
+    if not payload:
+        raise ValueError('The selected file is empty.')
+    suffix = Path(original_name).suffix.lower()
+
+    # Android sometimes supplies a generic MIME type. We therefore inspect the
+    # file contents instead of relying on the browser-reported type.
+    is_zip_container = zipfile.is_zipfile(BytesIO(payload))
+    if suffix in {'.xlsx', '.xls'}:
+        return pd.read_excel(BytesIO(payload))
+    if is_zip_container:
+        with zipfile.ZipFile(BytesIO(payload)) as archive:
+            names = [name for name in archive.namelist() if not name.endswith('/')]
+            if any(name.startswith('xl/') for name in names):
+                return pd.read_excel(BytesIO(payload))
+            candidates = [name for name in names if Path(name).suffix.lower() in {'.csv', '.xlsx', '.xls'}]
+            if not candidates:
+                raise ValueError('The ZIP does not contain a CSV or Excel file.')
+            candidates.sort(key=lambda name: (Path(name).suffix.lower() != '.csv', name.lower()))
+            selected = candidates[0]
+            inner = archive.read(selected)
+            if Path(selected).suffix.lower() == '.csv':
+                return _read_csv_payload(inner)
+            return pd.read_excel(BytesIO(inner))
+    return _read_csv_payload(payload)
+
+def _rankings_read_csv(file_obj: BinaryIO | TextIO) -> pd.DataFrame:
+    return _read_uploaded_table(file_obj)
 
 def _rankings_norm_col(value: object) -> str:
     return ' '.join(str(value).strip().lower().replace('_', ' ').split())
@@ -154,7 +206,7 @@ def _rankings_find_column(columns: list[str], aliases: list[str]) -> str | None:
 def load_rankings_csv(file_obj: BinaryIO | TextIO) -> pd.DataFrame:
     raw = _rankings_read_csv(file_obj)
     if raw.empty:
-        raise ValueError('The rankings CSV is empty.')
+        raise ValueError('The rankings file is empty.')
     rename: dict[str, str] = {}
     used: set[str] = set()
     for canonical, aliases in COLUMN_ALIASES.items():
@@ -166,7 +218,7 @@ def load_rankings_csv(file_obj: BinaryIO | TextIO) -> pd.DataFrame:
     if 'player_name' not in data.columns:
         raise ValueError('No player-name column was detected.')
     if 'external_rank' not in data.columns and 'external_value' not in data.columns:
-        raise ValueError('The CSV needs a rank/ECR column or a numeric value column.')
+        raise ValueError('The rankings file needs a rank/ECR column or a numeric value column.')
     for col in ['external_rank', 'external_value', 'external_age', 'external_years_exp', 'source_adp', 'tier']:
         if col in data.columns:
             data[col] = pd.to_numeric(data[col], errors='coerce')
@@ -247,17 +299,12 @@ def _metrics_find_column(columns: list[str], aliases: list[str]) -> str | None:
     return None
 
 def load_metrics_csv(file_obj: BinaryIO | TextIO) -> pd.DataFrame:
-    try:
-        raw = pd.read_csv(file_obj)
-    except UnicodeDecodeError:
-        if hasattr(file_obj, 'seek'):
-            file_obj.seek(0)
-        raw = pd.read_csv(file_obj, encoding='latin-1')
+    raw = _read_uploaded_table(file_obj)
     if raw.empty:
-        raise ValueError('The metrics CSV is empty.')
+        raise ValueError('The metrics file is empty.')
     name_col = _metrics_find_column(list(raw.columns), NAME_ALIASES)
     if name_col is None:
-        raise ValueError('No player-name column was detected in the metrics CSV.')
+        raise ValueError('No player-name column was detected in the metrics file.')
     rename = {name_col: 'metrics_player_name'}
     for aliases, canonical in [(POSITION_ALIASES, 'metrics_position'), (TEAM_ALIASES, 'metrics_nfl_team'), (ID_ALIASES, 'metrics_sleeper_id')]:
         found = _metrics_find_column(list(raw.columns), aliases)
@@ -587,12 +634,12 @@ def to_csv_bytes(frame: pd.DataFrame) -> bytes:
 def apply_second_year_overrides(data: pd.DataFrame, override_file) -> tuple[pd.DataFrame, int]:
     if override_file is None:
         return (data, 0)
-    raw = pd.read_csv(override_file)
+    raw = _read_uploaded_table(override_file)
     normalized_cols = {str(c).strip().lower().replace('_', ' '): c for c in raw.columns}
     name_col = normalized_cols.get('player name') or normalized_cols.get('player') or normalized_cols.get('name')
     flag_col = normalized_cols.get('is second year') or normalized_cols.get('second year') or normalized_cols.get('eligible')
     if name_col is None or flag_col is None:
-        raise ValueError('Override CSV needs player_name and is_second_year columns.')
+        raise ValueError('The override file needs player_name and is_second_year columns.')
     flags = raw[[name_col, flag_col]].copy()
     flags['normalized_name'] = flags[name_col].map(normalize_name)
     flags['override'] = flags[flag_col].astype(str).str.strip().str.lower().isin({'true', '1', 'yes', 'y'})
@@ -636,11 +683,11 @@ if roster_table.empty:
 with st.expander('Data sources and eligibility', expanded=True):
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        rankings_file = st.file_uploader('1. Rankings/value CSV', type=['csv'], help='FantasyCalc, FantasyPros, or another board. The app detects player, rank/value, position, team, age, experience, ADP, tier, and Sleeper ID columns.')
+        rankings_file = st.file_uploader('1. Rankings/value file', help='Select CSV, Excel, or a ZIP containing one. The unrestricted picker fixes Android files that appear greyed out.')
     with col_b:
-        metrics_files = st.file_uploader('2. Advanced metrics CSVs', type=['csv'], accept_multiple_files=True, help='Optional player-level exports such as usage, efficiency, projections, or injury metrics.')
+        metrics_files = st.file_uploader('2. Advanced metrics files', accept_multiple_files=True, help='Optional CSV, Excel, or ZIP exports such as usage, efficiency, projections, or injury metrics.')
     with col_c:
-        overrides_file = st.file_uploader('3. Second-year overrides', type=['csv'], help='Optional CSV: player_name,is_second_year. Useful when Sleeper experience data is wrong.')
+        overrides_file = st.file_uploader('3. Second-year overrides', help='Optional CSV or Excel file with player_name and is_second_year columns.')
 try:
     roster_table, override_count = apply_second_year_overrides(roster_table, overrides_file)
     if override_count:
